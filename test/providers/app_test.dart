@@ -538,6 +538,8 @@ void main() {
         );
         addTearDown(container.dispose);
 
+        container.read(coreStatusProvider.notifier).value =
+            CoreStatus.connected;
         final notifier = container.read(networkDetectionProvider.notifier);
         notifier.startCheck();
         await Future.delayed(commonDuration + const Duration(milliseconds: 50));
