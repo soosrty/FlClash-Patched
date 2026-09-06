@@ -274,6 +274,24 @@ jobs:
           flutter --version
           flutter pub get
 
+      - name: Build iOS Go core archives
+        if: matrix.platform == 'ios'
+        working-directory: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang="$(xcrun --sdk iphoneos --find clang)"
+          out="${GITHUB_WORKSPACE}/libclash/ios/arm64"
+          mkdir -p "$out"
+          export GOOS=ios GOARCH=arm64 CGO_ENABLED=1 CC="$clang"
+          export CGO_CFLAGS="-O3 -Werror -isysroot $sdk -miphoneos-version-min=14.0 -arch arm64"
+          export CGO_LDFLAGS="-isysroot $sdk -miphoneos-version-min=14.0 -arch arm64"
+          go build -tags=with_gvisor -ldflags='-w -s' -buildmode=c-archive -o "$out/libclash.a" .
+          go build -tags='with_gvisor with_low_memory' -ldflags='-w -s' -buildmode=c-archive -o "$out/libclash_lowmem.a" .
+          test -s "$out/libclash.a" -a -s "$out/libclash.h"
+          test -s "$out/libclash_lowmem.a" -a -s "$out/libclash_lowmem.h"
+
       - name: Setup
         env:
           ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
