@@ -16,6 +16,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
   private var suspendSupport = true
 
+  // A tunnel that dies at a fixed delay looks the same from the app side
+  // whether the extension was killed for its memory footprint or stopped by
+  // the system for another reason. Sampling the footprint distinguishes them.
+  private let memoryMonitorQueue = DispatchQueue(
+    label: "com.follow.clash.ne-core.memory"
+  )
+  private var memoryMonitorTimer: DispatchSourceTimer?
+  private var peakFootprintMB = 0
+  private var lastReportedFootprintMB = 0
+
   override func startTunnel(
     options: [String: NSObject]?,
     completionHandler: @escaping (Error?) -> Void
@@ -102,6 +112,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         )
         if started {
           self.sharedStateStore.saveRunTime()
+          // A tunnel that dies on its own says nothing about why. Sampling the
+          // footprint gives the one number that separates a memory kill from an
+          // unrelated shutdown.
+          self.eventQueue.recordDiagnostic(
+            "tunnel started\(Self.memorySuffix())"
+          )
+          self.startMemoryMonitor()
         }
         completionHandler(
           started ? nil : PacketTunnelProviderError.couldNotStartCoreTun
@@ -115,6 +132,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     completionHandler: @escaping () -> Void
   ) {
     logger.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
+    // os_log alone is not visible in the in-app log the user can export, and a
+    // tunnel that goes down on its own leaves no other trace of the cause.
+    eventQueue.recordDiagnostic(
+      "stopTunnel reason=\(Self.stopReasonName(reason))"
+        + " (\(reason.rawValue))\(Self.memorySuffix())",
+      level: "warning"
+    )
+    stopMemoryMonitor()
     sharedStateStore.clearRunTime()
     reloadControlWidget()
     eventQueue.stop()
@@ -228,6 +253,94 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
       return nil
     }
     return object["id"] as? String
+  }
+
+  // A Network Extension killed by the system never reaches stopTunnel, so the
+  // last thing on record has to be written while it is still alive. Sampling the
+  // footprint separates a jetsam kill (footprint climbing to the extension cap)
+  // from a tunnel torn down for any other reason (footprint flat).
+  private func startMemoryMonitor() {
+    stopMemoryMonitor()
+    let timer = DispatchSource.makeTimerSource(queue: memoryMonitorQueue)
+    timer.schedule(deadline: .now() + 2, repeating: 2)
+    timer.setEventHandler { [weak self] in
+      guard let self else {
+        return
+      }
+      guard let footprint = Self.memoryFootprintBytes() else {
+        return
+      }
+      let megabytes = footprint / (1024 * 1024)
+      self.peakFootprintMB = max(self.peakFootprintMB, megabytes)
+      // Only record on a new high-water mark, so a steady tunnel stays quiet
+      // while a run toward the memory cap leaves a visible trail.
+      guard megabytes >= self.lastReportedFootprintMB + 5 else {
+        return
+      }
+      self.lastReportedFootprintMB = megabytes
+      self.eventQueue.recordDiagnostic(
+        "memory footprint=\(megabytes)MB peak=\(self.peakFootprintMB)MB",
+        level: "info"
+      )
+    }
+    timer.resume()
+    memoryMonitorTimer = timer
+  }
+
+  private func stopMemoryMonitor() {
+    memoryMonitorTimer?.cancel()
+    memoryMonitorTimer = nil
+  }
+
+  private static func memorySuffix() -> String {
+    guard let footprint = memoryFootprintBytes() else {
+      return ""
+    }
+    return " footprint=\(footprint / (1024 * 1024))MB"
+  }
+
+  private static func memoryFootprintBytes() -> UInt64? {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+      MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
+    )
+    let result = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+      }
+    }
+    guard result == KERN_SUCCESS else {
+      return nil
+    }
+    return UInt64(info.phys_footprint)
+  }
+
+  // Mapped by raw value on purpose: the NEProviderStopReason case list differs
+  // between SDK versions, and naming a case the current SDK does not define
+  // would break the build rather than mislabel a log line.
+  private static let stopReasonNames: [Int: String] = [
+    0: "none",
+    1: "userInitiated",
+    2: "providerFailed",
+    3: "noNetworkAvailable",
+    4: "unrecoverableNetworkChange",
+    5: "providerDisabled",
+    6: "authenticationCanceled",
+    7: "configurationFailed",
+    8: "idleTimeout",
+    9: "configurationDisabled",
+    10: "configurationRemoved",
+    11: "superseded",
+    12: "userLogout",
+    13: "userSwitch",
+    14: "connectionFailed",
+    15: "sleep",
+    16: "appUpdate",
+    17: "internalError",
+  ]
+
+  private static func stopReasonName(_ reason: NEProviderStopReason) -> String {
+    stopReasonNames[reason.rawValue] ?? "unknown"
   }
 
   private func reloadControlWidget() {

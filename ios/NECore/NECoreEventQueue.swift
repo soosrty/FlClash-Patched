@@ -12,6 +12,9 @@ final class NECoreEventQueue {
 
   private var eventsSincePrune = 0
   private var coreActive = true
+  // Events arrive on the core callback thread while diagnostics are recorded
+  // from the memory sampler's queue, so the queue state needs a lock.
+  private let lock = NSLock()
 
   init(sharedStateStore: PacketTunnelSharedStateStore) {
     self.sharedStateStore = sharedStateStore
@@ -34,17 +37,81 @@ final class NECoreEventQueue {
   }
 
   func markCoreResponsive() {
+    lock.lock()
     coreActive = true
+    lock.unlock()
   }
 
-  private func enqueue(_ event: Data) {
-    guard coreActive else {
-      logger.warning("enqueue skipped: core is not active")
+  /// Publishes a log line as if the core had emitted it, so the reason a tunnel
+  /// went down reaches the app log instead of only os_log. The queue is backed
+  /// by files in the app group, so a record written here survives the extension
+  /// being terminated and is drained on the next app launch.
+  func recordDiagnostic(_ message: String, level: String = "info") {
+    let payload: [String: Any] = [
+      "method": "message",
+      "arguments": [
+        [
+          "type": "log",
+          "data": [
+            "LogLevel": level,
+            "source": "core",
+            "Payload": "[NE] \(message)",
+          ],
+        ],
+      ],
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
       return
     }
+    // A diagnostic is the one event worth keeping when backpressure is on: it
+    // explains the shutdown that the dropped events would have described.
+    enqueue(data, forceActive: true)
+  }
+
+  /// Resident footprint of this extension. NE processes get a much smaller
+  /// allowance than the host app, and jetsam kills without calling stopTunnel,
+  /// so the last sample before the log ends is the evidence of an OOM kill.
+  static func memoryFootprintBytes() -> UInt64? {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+      MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
+    )
+    let result = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+      }
+    }
+    guard result == KERN_SUCCESS else {
+      return nil
+    }
+    return info.phys_footprint
+  }
+
+  /// - Parameter forceActive: keeps a diagnostic from being dropped by
+  ///   backpressure. Passed as an argument rather than set by the caller so the
+  ///   lock is never held across this call (NSLock is not recursive).
+  private func enqueue(_ event: Data, forceActive: Bool = false) {
     guard let directory = eventQueueDirectory() else {
       logger.error("enqueue failed: missing app group dir")
       return
+    }
+    // The core callback thread and the memory monitor both reach this method, so
+    // coreActive/eventsSincePrune need serializing.
+    lock.lock()
+    defer { lock.unlock() }
+    if forceActive {
+      coreActive = true
+    }
+    // Backpressure must not be a one-way latch. The old code only cleared
+    // coreActive from markCoreResponsive(), so a startup burst (one event per
+    // provider) silenced the event stream for the rest of the session and every
+    // later log - including the reason a tunnel went down - was dropped.
+    if !coreActive {
+      guard eventFiles(in: directory).count < maxEventQueueFiles else {
+        return
+      }
+      coreActive = true
+      logger.info("enqueue resumed: event queue drained below cap")
     }
     do {
       try FileManager.default.createDirectory(
