@@ -521,7 +521,7 @@ class NetworkDetection extends _$NetworkDetection
     ref.onDispose(() {
       _resetCheckSession(null);
     });
-    ref.listenManual(coreStatusProvider, (previous, next) {
+    ref.listen(coreStatusProvider, (previous, next) {
       if (next == CoreStatus.connected && previous != next) {
         startCheck();
       }
