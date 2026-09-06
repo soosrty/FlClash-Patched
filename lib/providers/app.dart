@@ -521,6 +521,11 @@ class NetworkDetection extends _$NetworkDetection
     ref.onDispose(() {
       _resetCheckSession(null);
     });
+    ref.listenManual(coreStatusProvider, (previous, next) {
+      if (next == CoreStatus.connected && previous != next) {
+        startCheck();
+      }
+    });
     return const NetworkDetectionState(isLoading: true, ipInfo: null);
   }
 
@@ -540,6 +545,9 @@ class NetworkDetection extends _$NetworkDetection
       return;
     }
     final isStart = ref.read(isStartProvider);
+    if (isStart && ref.read(coreStatusProvider) != CoreStatus.connected) {
+      return;
+    }
     if (!isStart && _preIsStart == false && state.ipInfo != null) {
       return;
     }
