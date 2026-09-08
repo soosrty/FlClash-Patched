@@ -23,7 +23,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     label: "com.follow.clash.ne-core.memory"
   )
   private var memoryMonitorTimer: DispatchSourceTimer?
-  private var peakFootprintMB = 0
+  private var peakFootprintMB = 0 // Int, MB
   private var lastReportedFootprintMB = 0
 
   override func startTunnel(
@@ -270,7 +270,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
       guard let footprint = Self.memoryFootprintBytes() else {
         return
       }
-      let megabytes = footprint / (1024 * 1024)
+      // phys_footprint is UInt64 in task_vm_info; the sampler tracks Int MB.
+      let megabytes = Int(footprint / (1024 * 1024))
       self.peakFootprintMB = max(self.peakFootprintMB, megabytes)
       // Only record on a new high-water mark, so a steady tunnel stays quiet
       // while a run toward the memory cap leaves a visible trail.
@@ -296,7 +297,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     guard let footprint = memoryFootprintBytes() else {
       return ""
     }
-    return " footprint=\(footprint / (1024 * 1024))MB"
+    return " footprint=\(Int(footprint) / (1024 * 1024))MB"
   }
 
   private static func memoryFootprintBytes() -> UInt64? {
